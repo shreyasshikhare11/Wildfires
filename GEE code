@@ -1,0 +1,82 @@
+// ==========================================
+// 1. DYNAMIC SYSTEM SETUP FOR THE UNITED KINGDOM
+// ==========================================
+var targetYear = 2018; 
+var countryName = 'United Kingdom'; 
+
+var startDate = ee.Date.fromYMD(targetYear, 1, 1);
+var endDate = ee.Date(Date.now()); // Live system clock date
+
+// Load UK Boundary
+var countryBoundary = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+  .filter(ee.Filter.eq('country_na', countryName));
+
+// ==========================================
+// 2. HIGH-RESOLUTION THERMAL INPUT & MASK CREATION
+// ==========================================
+// Load and flatten your Suomi NPP VIIRS Near Real-Time dataset
+var suomiViirsClipped = ee.ImageCollection('NASA/LANCE/SNPP_VIIRS/C2')
+  .filterDate(startDate, endDate)
+  .filterBounds(countryBoundary)
+  .select('Bright_ti4')
+  .max() // Flatten to pick up peak heat signatures
+  .clip(countryBoundary);
+
+// HIGH PRECISION MASK: 1 where Suomi detects a thermal anomaly over 315K, 0 elsewhere
+var highResWildfireMask = suomiViirsClipped.gt(315);
+
+// ==========================================
+// 3. BACKUP RADAR SENSOR: HIGH-ACCURACY INTERSECTION
+// ==========================================
+// Pre-fire Baseline (Clean year structural reference)
+var preFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterDate('2023-01-01', '2023-12-31') 
+  .filterBounds(countryBoundary)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VV')
+  .mean();
+
+// Post-fire Current Framework
+var postFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterDate(startDate, endDate)
+  .filterBounds(countryBoundary)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VV')
+  .mean();
+
+// Calculate the radar backscatter texture difference
+var radarDifference = preFireSAR.subtract(postFireSAR).clip(countryBoundary);
+
+// THE UPGRADED STEP: Mask the Radar layer using the sharper 375m Suomi pixels
+var targetedSarChange = radarDifference.updateMask(highResWildfireMask);
+
+// ==========================================
+// 4. VISUALISATION PARAMETERS
+// ==========================================
+var changeVis = {
+  min: 0, 
+  max: 5, 
+  palette: ['#ffffff', '#ff9999', '#ff0000', '#4a0000']
+};
+
+var suomiVis = {
+  min: 300.0,
+  max: 400.0,
+  palette: ['yellow', 'orange', 'red', 'white', 'darkred']
+};
+
+// ==========================================
+// 5. MAP RENDERING & LAYER MANAGEMENT
+// ==========================================
+Map.centerObject(countryBoundary, 6);
+
+// Base Boundary Layer
+Map.addLayer(countryBoundary, {color: 'black', fillColor: '00000000'}, 'UK Border Line');
+
+// Layer 1: High-Precision SAR Radar Changes (Sharper 375m structural validation)
+Map.addLayer(targetedSarChange, changeVis, 'SAR Radar Confirmed Landscape Damage (375m)');
+
+// Layer 2: High-Resolution Suomi NPP NRT Hotspots
+Map.addLayer(suomiViirsClipped, suomiVis, 'Suomi NRT FIRMS (Clipped to UK)');
