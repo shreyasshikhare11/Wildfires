@@ -12,32 +12,80 @@ var countryBoundary = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
   .filter(ee.Filter.eq('country_na', countryName));
 
 // ==========================================
-// 2. HIGH-RESOLUTION THERMAL INPUT & MASK CREATION
+// 2. HIGH-RESOLUTION THERMAL INPUT & TIME-SERIES PROCESSING
 // ==========================================
-// Load and flatten your Suomi NPP VIIRS Near Real-Time dataset
-var suomiViirsClipped = ee.ImageCollection('NASA/LANCE/SNPP_VIIRS/C2')
+// Load Suomi NPP VIIRS dataset
+var suomiViirsCollection = ee.ImageCollection('NASA/LANCE/SNPP_VIIRS/C2')
   .filterDate(startDate, endDate)
-  .filterBounds(countryBoundary)
-  .select('Bright_ti4')
-  .max() // Flatten to pick up peak heat signatures
-  .clip(countryBoundary);
+  .filterBounds(countryBoundary);
 
-// HIGH PRECISION MASK: 1 where Suomi detects a thermal anomaly over 315K, 0 elsewhere
-var highResWildfireMask = suomiViirsClipped.gt(315);
+// Map over the collection to create a daily hotspot counting image series
+var dailyHotspots = suomiViirsCollection.map(function(img) {
+  var thermalBand = img.select('Bright_ti4');
+  
+  // Create binary image: 1 where pixel > 315K (active fire), 0 elsewhere
+  var firePixels = thermalBand.gt(315);
+  
+  // Count the number of pixels falling within the UK boundary for this image timestamp
+  var countPixels = firePixels.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: countryBoundary,
+    scale: 375, // Matches the native spatial resolution of Suomi VIIRS I-Bands
+    maxPixels: 1e9
+  });
+  
+  // Return an image with a single 'hotspot_count' band, preserving the capture time
+  return ee.Image.constant(countPixels.get('Bright_ti4'))
+    .rename('hotspot_count')
+    .set('system:time_start', img.get('system:time_start'));
+});
 
 // ==========================================
-// 3. BACKUP RADAR SENSOR: HIGH-ACCURACY INTERSECTION
+// 3. GENERATE THE TIME-SERIES CHART
 // ==========================================
-// Pre-fire Baseline (Clean year structural reference)
+var hotspotChart = ui.Chart.image.series({
+  imageCollection: dailyHotspots,
+  region: countryBoundary,
+  reducer: ee.Reducer.first(), // Pulls the pre-calculated count value out of each image
+  scale: 375,
+  xProperty: 'system:time_start'
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Daily Wildfire Hotspot Counts in the ' + countryName,
+  hAxis: {
+    title: 'Timeline', 
+    format: 'MMM dd, yyyy', 
+    gridlines: {count: 8}
+  },
+  vAxis: {
+    title: 'Number of Active Hotspots Detected', 
+    minValue: 0,
+    gridlines: {color: '#e0e0e0'}
+  },
+  colors: ['#e65c00'], // Orange-red bar coloration for clear data separation
+  legend: {position: 'none'},
+  bar: {groupWidth: '85%'} // Spacing adjustment between sequential days
+});
+
+// Display the graph on the right-hand interface panel
+print('--- FIRE EMISSION ANALYTICS ---');
+print(hotspotChart);
+
+// ==========================================
+// 4. BACKUP RADAR SENSOR: HIGH-ACCURACY INTERSECTION
+// ==========================================
+var maxThermalHeatMap = suomiViirsCollection.select('Bright_ti4').max().clip(countryBoundary);
+var highResWildfireMask = maxThermalHeatMap.gt(315);
+
 var preFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
-  .filterDate('2023-01-01', '2023-12-31') 
+  .filterDate(startDate, endDate) 
   .filterBounds(countryBoundary)
   .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
   .filter(ee.Filter.eq('instrumentMode', 'IW'))
   .select('VV')
   .mean();
 
-// Post-fire Current Framework
 var postFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
   .filterDate(startDate, endDate)
   .filterBounds(countryBoundary)
@@ -46,37 +94,16 @@ var postFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
   .select('VV')
   .mean();
 
-// Calculate the radar backscatter texture difference
 var radarDifference = preFireSAR.subtract(postFireSAR).clip(countryBoundary);
-
-// THE UPGRADED STEP: Mask the Radar layer using the sharper 375m Suomi pixels
 var targetedSarChange = radarDifference.updateMask(highResWildfireMask);
 
 // ==========================================
-// 4. VISUALISATION PARAMETERS
+// 5. VISUALISATION PARAMETERS & MAP RENDERING
 // ==========================================
-var changeVis = {
-  min: 0, 
-  max: 5, 
-  palette: ['#ffffff', '#ff9999', '#ff0000', '#4a0000']
-};
+var changeVis = {min: 0, max: 5, palette: ['#ffffff', '#ff9999', '#ff0000', '#4a0000']};
+var suomiVis = {min: 315.0, max: 400.0, palette: ['yellow', 'orange', 'red', 'white', 'darkred']};
 
-var suomiVis = {
-  min: 300.0,
-  max: 400.0,
-  palette: ['yellow', 'orange', 'red', 'white', 'darkred']
-};
-
-// ==========================================
-// 5. MAP RENDERING & LAYER MANAGEMENT
-// ==========================================
 Map.centerObject(countryBoundary, 6);
-
-// Base Boundary Layer
-Map.addLayer(countryBoundary, {color: 'black', fillColor: '00000000'}, 'UK Border Line');
-
-// Layer 1: High-Precision SAR Radar Changes (Sharper 375m structural validation)
+Map.addLayer(countryBoundary, {color: 'black', fillColor: '00000000'}, 'Nation Border Line');
 Map.addLayer(targetedSarChange, changeVis, 'SAR Radar Confirmed Landscape Damage (375m)');
-
-// Layer 2: High-Resolution Suomi NPP NRT Hotspots
-Map.addLayer(suomiViirsClipped, suomiVis, 'Suomi NRT FIRMS (Clipped to UK)');
+Map.addLayer(maxThermalHeatMap, suomiVis, 'Suomi NRT FIRMS');
