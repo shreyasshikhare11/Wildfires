@@ -1,109 +1,155 @@
-// ==========================================
-// 1. DYNAMIC SYSTEM SETUP FOR THE UNITED KINGDOM
-// ==========================================
-var targetYear = 2018; 
-var countryName = 'United Kingdom'; 
+// ========================================== 
+// 1. DYNAMIC SYSTEM SETUP FOR THE UNITED KINGDOM 
+// ========================================== 
+var targetYear = 2026; 
+var countryName = 'Greece'; 
 
-var startDate = ee.Date.fromYMD(targetYear, 1, 1);
-var endDate = ee.Date(Date.now()); // Live system clock date
+var startDate = ee.Date.fromYMD(targetYear, 6, 1);
+var endDate = ee.Date.fromYMD(targetYear, 8, 18);
 
-// Load UK Boundary
-var countryBoundary = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+// Load UK Boundary 
+var countryBoundary = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017') 
   .filter(ee.Filter.eq('country_na', countryName));
 
-// ==========================================
-// 2. HIGH-RESOLUTION THERMAL INPUT & TIME-SERIES PROCESSING
-// ==========================================
-// Load Suomi NPP VIIRS dataset
-var suomiViirsCollection = ee.ImageCollection('NASA/LANCE/SNPP_VIIRS/C2')
-  .filterDate(startDate, endDate)
+// Load High-Resolution Urban Land Cover to separate Wildland-Urban Interface (WUI)
+var landCover = ee.Image('ESA/WorldCover/v100/2020').clip(countryBoundary);
+var urbanBuiltUp = landCover.eq(50); // 50 = Urban structures
+
+// ========================================== 
+// 2. LOAD WEATHER REANALYSIS FOR PROPAGATION RISKS (ERA5-LAND)
+// ========================================== 
+var era5Weather = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR") 
+  .filterDate(startDate, endDate) 
   .filterBounds(countryBoundary);
 
-// Map over the collection to create a daily hotspot counting image series
-var dailyHotspots = suomiViirsCollection.map(function(img) {
-  var thermalBand = img.select('Bright_ti4');
+// Formulate dynamic rate of spread (ISI) and dynamic fire intensity (FWI) arrays
+var dailyWeatherRisk = era5Weather.map(function(img) {
+  var tempC = img.select('temperature_2m').subtract(273.15); 
+  var uWind = img.select('u_component_of_wind_10m');
+  var vWind = img.select('v_component_of_wind_10m');
+  var windSpeed = uWind.hypot(vWind).multiply(3.6); // Convert to km/h
   
-  // Create binary image: 1 where pixel > 315K (active fire), 0 elsewhere
-  var firePixels = thermalBand.gt(315);
+  var isi = windSpeed.multiply(0.2).add(tempC.multiply(0.1)).rename('ISI');
+  var fwi = isi.multiply(1.5).rename('FWI');
   
-  // Count the number of pixels falling within the UK boundary for this image timestamp
-  var countPixels = firePixels.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: countryBoundary,
-    scale: 375, // Matches the native spatial resolution of Suomi VIIRS I-Bands
-    maxPixels: 1e9
-  });
-  
-  // Return an image with a single 'hotspot_count' band, preserving the capture time
-  return ee.Image.constant(countPixels.get('Bright_ti4'))
-    .rename('hotspot_count')
+  return img.addBands([isi, fwi]).select(['ISI', 'FWI'])
     .set('system:time_start', img.get('system:time_start'));
 });
 
-// ==========================================
-// 3. GENERATE THE TIME-SERIES CHART
-// ==========================================
-var hotspotChart = ui.Chart.image.series({
-  imageCollection: dailyHotspots,
-  region: countryBoundary,
-  reducer: ee.Reducer.first(), // Pulls the pre-calculated count value out of each image
-  scale: 375,
-  xProperty: 'system:time_start'
-})
-.setChartType('ColumnChart')
-.setOptions({
-  title: 'Daily Wildfire Hotspot Counts in the ' + countryName,
-  hAxis: {
-    title: 'Timeline', 
-    format: 'MMM dd, yyyy', 
-    gridlines: {count: 8}
-  },
-  vAxis: {
-    title: 'Number of Active Hotspots Detected', 
-    minValue: 0,
-    gridlines: {color: '#e0e0e0'}
-  },
-  colors: ['#e65c00'], // Orange-red bar coloration for clear data separation
-  legend: {position: 'none'},
-  bar: {groupWidth: '85%'} // Spacing adjustment between sequential days
+var globalMaxFwi = dailyWeatherRisk.select('FWI').max().rename('FWI_first');
+var globalMaxIsi = dailyWeatherRisk.select('ISI').max().rename('ISI_first');
+
+// ========================================== 
+// 3. LOAD SUOMI VIIRS SATELLITE IMAGE PLOTS 
+// ========================================== 
+var suomiViirsCollection = ee.ImageCollection('NASA/LANCE/SNPP_VIIRS/C2') 
+  .filterDate(startDate, endDate) 
+  .filterBounds(countryBoundary);
+
+// ========================================== 
+// 4. DAY-BY-DAY BEHAVIORAL GENERATION COMPUTATION LOOPS
+// ========================================== 
+var matchedCollection = suomiViirsCollection.map(function(fireImg) {
+  var time = fireImg.get('system:time_start');
+  var thermal = fireImg.select('Bright_ti4');
+  
+  var dayWeatherMatch = dailyWeatherRisk.filterDate(
+    ee.Date(time), 
+    ee.Date(time).advance(1, 'day')
+  );
+  
+  var localFwi = dayWeatherMatch.select('FWI').reduce(ee.Reducer.first());
+  var localIsi = dayWeatherMatch.select('ISI').reduce(ee.Reducer.first());
+  
+  var fwi = ee.ImageCollection([globalMaxFwi, localFwi]).mosaic().rename('FWI');
+  var isi = ee.ImageCollection([globalMaxIsi, localIsi]).mosaic().rename('ISI');
+  
+  var fireMask = thermal.gt(315);
+  
+  var generation = ee.Image(1) // 1st Gen Default
+    .where(fwi.gte(5).and(fwi.lt(15)), 2)   
+    .where(fwi.gte(15).or(isi.gte(8)), 3)   
+    .where(urbanBuiltUp.eq(1), 4)           
+    .where(thermal.gt(360), 6)              
+    .updateMask(fireMask);
+    
+  return generation.rename('Gen_Class').set('system:time_start', time);
 });
 
-// Display the graph on the right-hand interface panel
-print('--- FIRE EMISSION ANALYTICS ---');
-print(hotspotChart);
+// Flatten the time series collection down into a clean maximum map representation
+var finalBehavioralGenerations = matchedCollection.select('Gen_Class').max().clip(countryBoundary);
 
-// ==========================================
-// 4. BACKUP RADAR SENSOR: HIGH-ACCURACY INTERSECTION
-// ==========================================
-var maxThermalHeatMap = suomiViirsCollection.select('Bright_ti4').max().clip(countryBoundary);
-var highResWildfireMask = maxThermalHeatMap.gt(315);
+// ========================================== 
+// 5. GRAPHICS GENERATION PANEL (CHARTS)
+// ========================================== 
+print("--- WILDLAND FIRE RISK & EMISSION ANALYTICS ---");
 
-var preFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
-  .filterDate(startDate, endDate) 
-  .filterBounds(countryBoundary)
-  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-  .filter(ee.Filter.eq('instrumentMode', 'IW'))
-  .select('VV')
-  .mean();
+// Frequency Chart tracking raw fire volume count fluctuations
+var dailyHotspots = suomiViirsCollection.map(function(img) {
+  var countPixels = img.select('Bright_ti4').gt(315).reduceRegion({ 
+    reducer: ee.Reducer.sum(), geometry: countryBoundary, scale: 375, maxPixels: 1e9 
+  }); 
+  return ee.Image.constant(countPixels.get('Bright_ti4')).rename('hotspot_count').set('system:time_start', img.get('system:time_start')); 
+});
 
-var postFireSAR = ee.ImageCollection('COPERNICUS/S1_GRD')
-  .filterDate(startDate, endDate)
-  .filterBounds(countryBoundary)
-  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-  .filter(ee.Filter.eq('instrumentMode', 'IW'))
-  .select('VV')
-  .mean();
+print(ui.Chart.image.series({
+  imageCollection: dailyHotspots, region: countryBoundary, reducer: ee.Reducer.first(), scale: 375, xProperty: 'system:time_start'
+}).setChartType('ColumnChart').setOptions({
+  title: 'Daily Wildfire Hotspot Occurrences in the UK', hAxis: {title: 'Timeline'}, vAxis: {title: 'Amount of Wildfires Occurring'}, colors: ['#e65c00'], legend: {position: 'none'}
+}));
 
-var radarDifference = preFireSAR.subtract(postFireSAR).clip(countryBoundary);
-var targetedSarChange = radarDifference.updateMask(highResWildfireMask);
+// FIXED: Check if the final map contains actual pixel entries before drawing the pie chart
+var totalPixelsFound = finalBehavioralGenerations.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: countryBoundary,
+  scale: 375,
+  maxPixels: 1e5
+}).getNumber('Gen_Class');
 
-// ==========================================
-// 5. VISUALISATION PARAMETERS & MAP RENDERING
-// ==========================================
-var changeVis = {min: 0, max: 5, palette: ['#ffffff', '#ff9999', '#ff0000', '#4a0000']};
-var suomiVis = {min: 315.0, max: 400.0, palette: ['yellow', 'orange', 'red', 'white', 'darkred']};
+// Conditional execution stops the script from crashing if there are zero fires
+ee.Algorithms.If(
+  totalPixelsFound.gt(0),
+  function() {
+    var fireVectorsForPie = finalBehavioralGenerations.sample({
+      region: countryBoundary, scale: 375, numPixels: 500, geometries: false
+    });
+    var riskRatioChart = ui.Chart.feature.groups({
+      features: fireVectorsForPie, xProperty: 'Gen_Class', yProperty: 'Gen_Class', seriesProperty: 'Gen_Class'
+    }).setChartType('PieChart').setOptions({
+      title: 'Verified Distribution Ratio of Behavioral Fire Generations',
+      slices: { 0: {color: '#add8e6'}, 1: {color: '#fdbb84'}, 2: {color: '#fc8d59'}, 3: {color: '#bd0026'}, 4: {color: '#7a0177'}, 5: {color: '#000000'} }
+    });
+    print(riskRatioChart);
+  }(),
+  print("Notice: No high-confidence active fire signatures detected within this timeframe to populate the Pie Chart ratio.")
+);
 
-Map.centerObject(countryBoundary, 6);
-Map.addLayer(countryBoundary, {color: 'black', fillColor: '00000000'}, 'Nation Border Line');
-Map.addLayer(targetedSarChange, changeVis, 'SAR Radar Confirmed Landscape Damage (375m)');
-Map.addLayer(maxThermalHeatMap, suomiVis, 'Suomi NRT FIRMS');
+// ========================================== 
+// 6. MAP VIEWPORT RENDERING & STYLING
+// ========================================== 
+var generationVis = {
+  min: 1, max: 6, 
+  palette: ['#add8e6', '#fdbb84', '#fc8d59', '#bd0026', '#7a0177', '#000000']
+};
+
+Map.centerObject(countryBoundary, 6); 
+Map.addLayer(countryBoundary, {color: 'black', fillColor: '00000000'}, 'UK Border Baseline'); 
+Map.addLayer(finalBehavioralGenerations, generationVis, 'Behavioral Wildfire Generation Class');
+
+// ========================================== 
+// 7. CONSTRUCT LEGEND WIDGET
+// ========================================== 
+var legend = ui.Panel({style: {position: 'bottom-right', padding: '10px 18px', backgroundColor: 'white'}});
+legend.add(ui.Label({value: 'Wildfire Generation Metrics', style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 8px 0'}}));
+var makeLegendRow = function(color, title, desc) {
+  var colorBox = ui.Label({style: {backgroundColor: color, padding: '10px 4px', margin: '0 8px 0 0', height: '12px'}});
+  var textContainer = ui.Panel({widgets: [ui.Label({value: title, style: {fontWeight: 'bold', fontSize: '11px', margin: '0'}}), ui.Label({value: desc, style: {fontSize: '10px', color: '#555', margin: '0'}})]});
+  return ui.Panel({widgets: [colorBox, textContainer], layout: ui.Panel.Layout.Flow('horizontal'), style: {margin: '4px 0'}});
+};
+legend.add(makeLegendRow('#add8e6', '1st Generation', 'Fuel continuity dictated; minor surface spread.'));
+legend.add(makeLegendRow('#fdbb84', '2nd Generation', 'Increased fuel load intensity; slower overall velocity.'));
+legend.add(makeLegendRow('#fc8d59', '3rd Generation', 'High-speed linear fronts; driven heavily by wind vectors.'));
+legend.add(makeLegendRow('#bd0026', '4th Generation (WUI)', 'Fires actively entering structural urban/suburban zones.'));
+legend.add(makeLegendRow('#7a0177', '5th Generation', 'Simultaneous national multi-front spikes straining resources.'));
+legend.add(makeLegendRow('#000000', '6th Generation', 'Extreme radiant energy core driving pyrocumulus weather systems.'));
+Map.add(legend);
