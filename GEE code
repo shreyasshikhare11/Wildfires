@@ -1,5 +1,5 @@
 // ========================================== 
-// 1. DYNAMIC SYSTEM SETUP FOR THE UNITED KINGDOM 
+// 1. DYNAMIC SYSTEM SETUP FOR ANY COUNTRY SUBJECTED TO WILDFIRES 
 // ========================================== 
 var targetYear = 2026; 
 var countryName = 'Greece'; 
